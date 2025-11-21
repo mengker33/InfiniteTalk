@@ -11,7 +11,7 @@ from einops import rearrange
 from diffusers import ModelMixin
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 
-from .attention import flash_attention, SingleStreamMutiAttention, attention
+from .attention import flash_attention, SingleStreamMutiAttention, attention, FlashAttnV3Gaudi
 from ..utils.multitalk_utils import get_attn_map_with_target
 import logging
 try:
@@ -191,6 +191,7 @@ class WanSelfAttention(nn.Module):
         self.o = nn.Linear(dim, dim)
         self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
+        self.fav3 = FlashAttnV3Gaudi()
 
     def forward(self, x, seq_lens, grid_sizes, freqs, ref_target_masks=None):
         b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
@@ -236,6 +237,7 @@ class WanI2VCrossAttention(WanSelfAttention):
         self.k_img = nn.Linear(dim, dim)
         self.v_img = nn.Linear(dim, dim)
         self.norm_k_img = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
+        self.fav3 = FlashAttnV3Gaudi()
 
     def forward(self, x, context, context_lens):
         context_img = context[:, :257]
@@ -252,9 +254,14 @@ class WanI2VCrossAttention(WanSelfAttention):
             img_x = sageattn(q, k_img, v_img, tensor_layout='NHD')
             x = sageattn(q, k, v, tensor_layout='NHD')
         else:   
-            img_x = attention(q, k_img, v_img, k_lens=None)
+            # img_x = attention(q, k_img, v_img, k_lens=None)
+            htcore.mark_step()
+            img_x = self.fav3.forward(q, k_img, v_img, layout_head_first=False)
+            htcore.mark_step()
             # compute attention
-            x = attention(q, k, v, k_lens=context_lens)
+            # x = attention(q, k, v, k_lens=context_lens)
+            x = self.fav3.forward(q, k, v, layout_head_first=False)
+            htcore.mark_step()
 
         # output
         x = x.flatten(2)

@@ -1,4 +1,7 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
+import os
+from typing import Optional
+import math
 import torch
 import torch.nn as nn
 from einops import rearrange, repeat
@@ -10,6 +13,7 @@ from wan.distributed.parallel_state import (
 )
 # import xformers.ops
 from habana_frameworks.torch.hpex.kernels import FusedSDPA
+import habana_frameworks.torch.core as htcore
 
 try:
     import flash_attn_interface
@@ -29,6 +33,105 @@ __all__ = [
     'flash_attention',
     'attention',
 ]
+
+class FlashAttnV3Gaudi:
+    def __init__ (self):
+        self.q_chunk = int(os.environ.get("FA3_Q_CHUNK", 8192))
+        self.kv_chunk = int(os.environ.get("FA3_KV_CHUNK", 8192))
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        fsdpa_mode: str = "fast",
+        cp_size: int = 1,
+        layout_head_first = False,
+        ) -> torch.Tensor:
+
+        # Change to (batch, heads, seq_len, head_dim)
+        if not layout_head_first:
+            query, key, value = (x.permute(0, 2, 1, 3).contiguous() for x in (query, key, value))
+        query_len = query.size(-2)
+        key_len = key.size(-2)
+
+        # In the case of cross-attn, use FusedSDPA.
+        if  (query_len * cp_size) != key_len:
+            output = FusedSDPA.apply(
+                query,
+                key,
+                value,
+                attention_mask,
+                0.0,
+                False,
+                None,
+                fsdpa_mode,
+                None
+            )
+            return output.permute(0, 2, 1, 3).contiguous() if not layout_head_first else output
+ 
+        #Flash Attention V3 for Full Attention
+        linv_factor = 128.0 if fsdpa_mode == "fast" else 1.0
+
+        num_query_chunk = int((query_len - 1) / self.q_chunk) + 1
+        num_kv_chunk = int((key_len - 1) / self.kv_chunk) + 1
+
+        final_hidden_list = []
+
+        for query_idx in range(num_query_chunk):
+
+            query_start = query_idx * self.q_chunk
+            query_end = (query_idx + 1) * self.q_chunk if query_idx < num_query_chunk - 1 else query_len
+            query_slice = query[..., query_start:query_end, :]
+
+            out = None
+            m = None
+            linv = None
+
+            for kv_idx in range(num_kv_chunk):
+
+                kv_start = kv_idx * self.kv_chunk
+                kv_end = (kv_idx + 1) * self.kv_chunk if kv_idx < num_kv_chunk - 1 else key_len
+
+                key_slice = key[..., kv_start:kv_end, :]
+                value_slice = value[..., kv_start:kv_end, :]
+
+                block_out, block_m, block_linv, _ = torch.ops.hpu.sdpa_recomp_fwd(
+                    query_slice,
+                    key_slice,
+                    value_slice,
+                    None,
+                    0.0,
+                    1 / math.sqrt(query.shape[-1]),
+                    False,
+                    True,
+                    "fast",
+                    None, #vsl,
+                    "left",
+                )
+
+                if kv_idx == 0:
+                    out = block_out.to(torch.float32)
+                    m = block_m.to(torch.float32)
+                    linv = block_linv.to(torch.float32) * linv_factor
+                else:
+                    block_linv = block_linv.to(torch.float32) * linv_factor
+                    block_m = block_m.to(torch.float32)
+                    block_out = block_out.to(torch.float32)
+                    new_m = torch.maximum(m, block_m)
+                    l_rescaled = (1.0 / linv) * torch.exp(m - new_m)
+                    block_l_rescaled = (1.0 / block_linv) * torch.exp(block_m - new_m)
+                    new_linv = 1.0 / (l_rescaled + block_l_rescaled)
+                    out = (l_rescaled * new_linv) * out + (block_l_rescaled * new_linv) * block_out
+                    linv = new_linv
+                    m = new_m
+
+            final_hidden_list.append(out.to(query.dtype))
+
+        output = torch.cat(final_hidden_list, dim=-2)
+
+        return output.permute(0, 2, 1, 3).contiguous() if not layout_head_first else output
 
 
 def flash_attention(
@@ -233,6 +336,7 @@ class SingleStreamAttention(nn.Module):
 
         self.add_q_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
         self.add_k_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
+        self.fav3 = FlashAttnV3Gaudi()
 
     def forward(self, x: torch.Tensor, encoder_hidden_states: torch.Tensor, shape=None, enable_sp=False, kv_seq=None) -> torch.Tensor:
        
@@ -260,23 +364,26 @@ class SingleStreamAttention(nn.Module):
             encoder_k = self.add_k_norm(encoder_k)
 
 
-        q = rearrange(q, "B H M K -> B M H K")
-        encoder_k = rearrange(encoder_k, "B H M K -> B M H K")
-        encoder_v = rearrange(encoder_v, "B H M K -> B M H K")
+        # q = rearrange(q, "B H M K -> B M H K")
+        # encoder_k = rearrange(encoder_k, "B H M K -> B M H K")
+        # encoder_v = rearrange(encoder_v, "B H M K -> B M H K")
 
         if enable_sp:
             # context parallel
-            sp_size = get_sequence_parallel_world_size()
-            sp_rank = get_sequence_parallel_rank()
-            visual_seqlen, _ = split_token_counts_and_frame_ids(N_t, N_h * N_w, sp_size, sp_rank)
-            assert kv_seq is not None, f"kv_seq should not be None."
+            # sp_size = get_sequence_parallel_world_size()
+            # sp_rank = get_sequence_parallel_rank()
+            # visual_seqlen, _ = split_token_counts_and_frame_ids(N_t, N_h * N_w, sp_size, sp_rank)
+            # assert kv_seq is not None, f"kv_seq should not be None."
             # attn_bias = xformers.ops.fmha.attn_bias.BlockDiagonalMask.from_seqlens(visual_seqlen, kv_seq)
             attn_bias = None
         else:
             attn_bias = None
 
-        x = attention(q, encoder_k, encoder_v)
-        x = rearrange(x, "B M H K -> B H M K")
+        htcore.mark_step()
+        x = self.fav3.forward(q, encoder_k, encoder_v, cp_size=get_sequence_parallel_world_size() if enable_sp else 1, layout_head_first=True)
+        htcore.mark_step()
+        # x = attention(q, encoder_k, encoder_v)
+        # x = rearrange(x, "B M H K -> B H M K")
 
         # linear transform
         x_output_shape = (B, N, C)
@@ -324,6 +431,7 @@ class SingleStreamMutiAttention(SingleStreamAttention):
         self.rope_bak = int(self.class_range // 2)
 
         self.rope_1d = RotaryPositionalEmbedding1D(self.head_dim)
+        self.fav3 = FlashAttnV3Gaudi()
 
     def forward(self, 
                 x: torch.Tensor, 
@@ -385,14 +493,10 @@ class SingleStreamMutiAttention(SingleStreamAttention):
         encoder_k = self.rope_1d(encoder_k, encoder_pos)
         encoder_k = rearrange(encoder_k, "B H (N_t S) C -> (B N_t) H S C", N_t=N_t)
 
-        # q shape: [B, H, M, K], x shape: [B, H, M, K]
-        x = FusedSDPA.apply(q, encoder_k, encoder_v, None,
-                0.0,
-                False,
-                None,
-                "fast",
-                None,)
-
+        htcore.mark_step()
+        x = self.fav3.forward(q, encoder_k, encoder_v, layout_head_first=True)
+        htcore.mark_step()
+        
         # linear transform
         x_output_shape = (B, N, C)
         x = x.transpose(1, 2) 

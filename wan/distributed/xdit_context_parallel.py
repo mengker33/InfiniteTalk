@@ -13,7 +13,7 @@ from einops import rearrange
 
 from ..modules.model import sinusoidal_embedding_1d
 from ..utils.multitalk_utils import get_attn_map_with_target, split_token_counts_and_frame_ids, normalize_and_scale
-from ..modules.attention import SingleStreamAttention, SingleStreamMutiAttention, attention
+from ..modules.attention import SingleStreamAttention, SingleStreamMutiAttention, attention, FlashAttnV3Gaudi
 
 
 def pad_freqs(original_tensor, target_len):
@@ -505,7 +505,8 @@ def usp_attn_forward_multitalk(self,
     k = get_sp_group().all_gather(k, dim=1)
     v = get_sp_group().all_gather(v, dim=1)
 
-    x = attention(half(q),half(k),half(v),)
+    # x = attention(half(q),half(k),half(v),)
+    x = self.fav3.forward(half(q), half(k), half(v), cp_size=get_sequence_parallel_world_size(), layout_head_first=False)
 
     # output
     x = x.flatten(2)
@@ -585,14 +586,13 @@ def usp_crossattn_multi_forward_multitalk(self,
         encoder_k = self.rope_1d(encoder_k, encoder_pos)
 
         # get attn
-        q = rearrange(q, "B H M K -> B M H K")
-        encoder_k = rearrange(encoder_k, "B H M K -> B M H K")
-        encoder_v = rearrange(encoder_v, "B H M K -> B M H K")
+        # q = rearrange(q, "B H M K -> B M H K")
+        # encoder_k = rearrange(encoder_k, "B H M K -> B M H K")
+        # encoder_v = rearrange(encoder_v, "B H M K -> B M H K")
 
         # attn_bias = xformers.ops.fmha.attn_bias.BlockDiagonalMask.from_seqlens(visual_seqlen, kv_seq)
         # x = xformers.ops.memory_efficient_attention(q, encoder_k, encoder_v, attn_bias=attn_bias, op=None,)
-        attn_bias = None
-        x = attention(q, encoder_k, encoder_v)
+        x = self.fav3.forward(q, encoder_k, encoder_v, cp_size=get_sequence_parallel_world_size(), layout_head_first=True)
 
         # linear transform
         x_output_shape = (B, N, C)
