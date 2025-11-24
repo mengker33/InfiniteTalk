@@ -212,7 +212,9 @@ class WanSelfAttention(nn.Module):
         if USE_SAGEATTN:
             x = sageattn(q.to(torch.bfloat16), k.to(torch.bfloat16), v, tensor_layout='NHD')
         else:
-            x = attention (q, k, v)
+            htcore.mark_step()
+            x = self.fav3.forward(q, k, v, layout_head_first=False)
+            htcore.mark_step()
 
         # output
         x = x.flatten(2)
